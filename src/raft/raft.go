@@ -50,6 +50,7 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 
 	// Persistent state
+	state       string
 	currentTerm int
 	votedFor    int
 	log         []int
@@ -58,6 +59,7 @@ type Raft struct {
 	commitIndex                           int
 	lastApplied                           int
 	receivedAppendEntriesInCurrentTimeout bool
+	currentVotes                          int
 
 	// Volatile state (leader)
 	nextIndex  []int
@@ -116,11 +118,37 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-//
-// example RequestVote RPC handler.
-//
+type RespondVoteReply struct{}
+
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	// fmt.Println("Received vote request", rf.me, args.Term, args.CandidateId)
+
+	reply.Term = args.Term
+	reply.VoteGranted = rf.votedFor == -1 && args.Term >= rf.currentTerm // Haven't voted yet on this term
+
+	responseSuccess := rf.sendRespondVote(args.CandidateId, reply, &RespondVoteReply{})
+
+	if reply.VoteGranted && responseSuccess {
+		rf.votedFor = args.CandidateId
+	}
+}
+
+func (rf *Raft) RespondVote(args *RequestVoteReply, reply *RespondVoteReply) {
+	// fmt.Println("Received vote response", rf.me, args.VoteGranted)
+
+	if args.VoteGranted {
+		rf.currentVotes++
+	}
+}
+
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendRespondVote(server int, args *RequestVoteReply, reply *RespondVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RespondVote", args, reply)
+	return ok
 }
 
 type AppendEntriesArgs struct {
@@ -135,40 +163,6 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
-}
-
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
 }
 
 //
@@ -223,6 +217,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.persister = persister
 	rf.me = me
 
+	rf.state = "follower"
 	rf.currentTerm = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -254,5 +249,50 @@ func (rf *Raft) electionTimeout() {
 		go rf.electionTimeout()
 	} else {
 		fmt.Println("Didn't received a AppendEntries during timeout, starting election", rf.me)
+
+		go rf.election()
+	}
+}
+
+func (rf *Raft) election() {
+	rf.state = "candidate"
+	rf.currentVotes = 0
+	rf.votedFor = rf.me
+	rf.currentTerm++
+	rf.persist()
+
+	args := &RequestVoteArgs{}
+
+	args.Term = rf.currentTerm
+	// Votes for itself
+	args.CandidateId = rf.me
+	// Random values, not used on 2A case
+	args.LastLogIndex = 0
+	args.LastLogTerm = 0
+
+	for peer := range rf.peers {
+		// fmt.Println("Sending request to peer", rf.me, peer)
+		go rf.sendRequestVote(peer, args, &RequestVoteReply{})
+	}
+
+	// Random number between 300 and 600 (ms)
+	timeout := time.Duration((rand.Intn(600-300) + 300)) * time.Millisecond
+
+	fmt.Println("Started election timeout", rf.me, timeout)
+
+	time.Sleep(timeout)
+
+	wonElection := (rf.currentVotes > len(rf.peers)/2) && rf.state == "candidate"
+
+	fmt.Println("Election finished", rf.me, wonElection, rf.currentVotes, len(rf.peers)/2)
+
+	if wonElection {
+		fmt.Println("\033[32m", "Won election! Sending heartbeats", rf.me, rf.currentVotes)
+
+		rf.state = "leader"
+	} else {
+		fmt.Println("\033[31m", "Lost election!", rf.me, rf.currentVotes)
+
+		go rf.electionTimeout()
 	}
 }
