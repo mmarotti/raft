@@ -18,8 +18,11 @@ package raft
 //
 
 import (
+	"fmt"
 	"labrpc"
+	"math/rand"
 	"sync"
+	"time"
 )
 
 // import "bytes"
@@ -52,10 +55,11 @@ type Raft struct {
 	log         []int
 
 	// Volatile state
-	commitIndex int
-	lastApplied int
+	commitIndex                           int
+	lastApplied                           int
+	receivedAppendEntriesInCurrentTimeout bool
 
-	// Volatile state
+	// Volatile state (leader)
 	nextIndex  []int
 	matchIndex []int
 }
@@ -100,10 +104,6 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
 type RequestVoteArgs struct {
 	Term         int
 	CandidateId  int
@@ -111,10 +111,6 @@ type RequestVoteArgs struct {
 	LastLogTerm  int
 }
 
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
 type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
@@ -125,6 +121,20 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	LeaderCommit int
+	Entries      []int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
 }
 
 //
@@ -205,17 +215,44 @@ func (rf *Raft) Kill() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
+	fmt.Println("Creating new Raft server", peers, me)
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here (2A, 2B, 2C).
+	rf.currentTerm = 0
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	// There's no null value for int, as peers starts at 0 we are using -1 as null
+	rf.votedFor = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	go rf.electionTimeout()
+
 	return rf
+}
+
+func (rf *Raft) electionTimeout() {
+	// Store if server received AppendEntries from leader in current timeout window
+	rf.receivedAppendEntriesInCurrentTimeout = false
+
+	// Random number between 150 and 300 (ms) as specified on article
+	timeout := time.Duration((rand.Intn(300-150) + 150)) * time.Millisecond
+
+	fmt.Println("Waiting for AppendEntries", rf.me, timeout)
+
+	time.Sleep(timeout)
+
+	if rf.receivedAppendEntriesInCurrentTimeout {
+		fmt.Println("Received a AppendEntries during timeout, starting another", rf.me)
+
+		go rf.electionTimeout()
+	} else {
+		fmt.Println("Didn't received a AppendEntries during timeout, starting election", rf.me)
+	}
 }
