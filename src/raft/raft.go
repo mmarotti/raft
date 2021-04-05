@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"labrpc"
 	"math/rand"
@@ -69,10 +71,7 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	return rf.currentTerm, rf.state == "leader"
 }
 
 //
@@ -81,29 +80,24 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	buf := new(bytes.Buffer)
+	enc := gob.NewEncoder(buf)
+	enc.Encode(rf.currentTerm)
+	enc.Encode(rf.votedFor)
+	enc.Encode(rf.log)
+	rf.persister.SaveRaftState(buf.Bytes())
 }
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.log)
+	rf.persister.SaveRaftState(data)
 }
 
 type RequestVoteArgs struct {
@@ -118,10 +112,12 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-type RespondVoteReply struct{}
+type RespondVoteReply struct {
+	Success bool
+}
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// fmt.Println("Received vote request", rf.me, args.Term, args.CandidateId)
+	// fmt.Println("Received vote request", rf.me, args.CandidateId, rf.votedFor, args.Term, rf.currentTerm)
 
 	reply.Term = args.Term
 	reply.VoteGranted = rf.votedFor == -1 && args.Term >= rf.currentTerm // Haven't voted yet on this term
@@ -130,6 +126,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if reply.VoteGranted && responseSuccess {
 		rf.votedFor = args.CandidateId
+		rf.persist()
 	}
 }
 
@@ -165,6 +162,25 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	fmt.Println("Recieved new AppendEntries", rf.me, args.LeaderId, rf.currentTerm)
+
+	if args.Term >= rf.currentTerm {
+		rf.state = "follower"
+		rf.receivedAppendEntriesInCurrentTimeout = true
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.currentVotes = 0
+
+		rf.persist()
+	}
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -194,9 +210,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
 //
-func (rf *Raft) Kill() {
-	// Your code here, if desired.
-}
+func (rf *Raft) Kill() {}
 
 //
 // the service or tester wants to create a Raft server. the ports
@@ -219,10 +233,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	rf.state = "follower"
 	rf.currentTerm = 0
-	rf.commitIndex = 0
-	rf.lastApplied = 0
-	// There's no null value for int, as peers starts at 0 we are using -1 as null
-	rf.votedFor = -1
+	rf.votedFor = -1 // There's no null value for int, as peers starts at 0 we are using -1 as null
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -257,7 +268,6 @@ func (rf *Raft) electionTimeout() {
 func (rf *Raft) election() {
 	rf.state = "candidate"
 	rf.currentVotes = 0
-	rf.votedFor = rf.me
 	rf.currentTerm++
 	rf.persist()
 
@@ -287,12 +297,34 @@ func (rf *Raft) election() {
 	fmt.Println("Election finished", rf.me, wonElection, rf.currentVotes, len(rf.peers)/2)
 
 	if wonElection {
-		fmt.Println("\033[32m", "Won election! Sending heartbeats", rf.me, rf.currentVotes)
+		fmt.Println("\033[32m", "Won election! Sending heartbeats", rf.me, rf.currentVotes, "\033[0m")
 
 		rf.state = "leader"
+		go rf.sendHeartbeats()
 	} else {
-		fmt.Println("\033[31m", "Lost election!", rf.me, rf.currentVotes)
+		fmt.Println("\033[31m", "Lost election!", rf.me, rf.currentVotes, "\033[0m")
+
+		rf.state = "follower"
+		rf.votedFor = -1
+		rf.persist()
 
 		go rf.electionTimeout()
+	}
+}
+
+func (rf *Raft) sendHeartbeats() {
+	for rf.state == "leader" {
+		args := &AppendEntriesArgs{}
+
+		args.Term = rf.currentTerm
+		args.LeaderId = rf.me
+
+		for peer := range rf.peers {
+			if peer != rf.me {
+				go rf.sendAppendEntries(peer, args, &AppendEntriesReply{})
+			}
+		}
+
+		time.Sleep(time.Duration(100) * time.Millisecond)
 	}
 }
