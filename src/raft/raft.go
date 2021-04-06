@@ -286,11 +286,29 @@ func (rf *Raft) election() {
 	}
 
 	// Random number between 300 and 600 (ms)
-	timeout := time.Duration((rand.Intn(600-300) + 300)) * time.Millisecond
+	randomValue := rand.Intn(600 - 300)
+	timeout := time.Duration((randomValue + 300)) * time.Millisecond
 
 	fmt.Println("Started election timeout", rf.me, timeout)
 
-	time.Sleep(timeout)
+	miniTimeout := timeout.Milliseconds() / 300
+	durationMiniTimeout := time.Duration(miniTimeout) * time.Millisecond
+
+	for miniTimeout < timeout.Milliseconds() {
+		time.Sleep(durationMiniTimeout)
+
+		wonElection := (rf.currentVotes > len(rf.peers)/2) && rf.state == "candidate"
+		if wonElection {
+			fmt.Println("\033[32m", "Won election! Sending heartbeats", rf.me, rf.currentVotes, "\033[0m")
+
+			rf.state = "leader"
+			go rf.sendHeartbeats()
+		}
+
+		miniTimeout += miniTimeout
+	}
+
+	//time.Sleep(timeout)
 
 	wonElection := (rf.currentVotes > len(rf.peers)/2) && rf.state == "candidate"
 
